@@ -1,0 +1,120 @@
+name: build-wq-ipa
+
+# 无需 Mac：在 GitHub Actions 的 macOS runner 上编译 WQCollector.dylib，
+# 注入到 IPA 里；如果配了签名 secrets，还会顺带签好名。
+#
+# 仓库需要包含：
+#   WQ/WQCollector.m
+#   WQ/worse_query.m
+#   WQ/worse_query.h
+#   inject.py
+#   app.ipa                ← 你的 *_wq_ready.ipa（<=100MB 可直接提交，或用 release 下载）
+#
+# Secrets（可选，配了才会签名）：
+#   SIGN_P12_BASE64        base64 -w0 cert.p12
+#   SIGN_P12_PASS          p12 密码
+#   SIGN_PROFILE_BASE64    base64 -w0 profile.mobileprovision
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: 'CFBundleIdentifier（可安装的值，别用 com.apple.*）'
+        default: 'com.yourco.shell'
+        required: true
+      identifier:
+        description: 'CodeDirectory identifier（MHA 判据，保持默认）'
+        default: 'com.apple.mobile.MobileHouseArrest'
+        required: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境检查
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          python3 --version
+
+      - name: 编译 WQCollector.dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 -dynamiclib \
+            -isysroot "$SDK" -miphoneos-version-min=15.0 \
+            -fobjc-arc -O2 -Wno-deprecated-declarations \
+            -framework Foundation -framework UIKit -framework Security -lz \
+            -install_name @executable_path/Frameworks/AppRuntime/WQCollector.dylib \
+            -o WQCollector.dylib WQ/WQCollector.m WQ/worse_query.m
+          ls -l WQCollector.dylib
+          file WQCollector.dylib
+
+      - name: 注入 IPA（bundle id 与 identifier 解耦）
+        run: |
+          python3 inject.py app.ipa WQCollector.dylib injected.ipa \
+            @executable_path/Frameworks/AppRuntime/WQCollector.dylib
+          # 改 bundle id（inject.py 不动 Info.plist，这里单独改一次）
+          rm -rf work && mkdir work && unzip -qo injected.ipa -d work
+          PLIST=$(ls work/Payload/*.app/Info.plist)
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${{ inputs.bundle_id }}" "$PLIST"
+          ( cd work && rm -f ../injected.ipa && zip -qry ../injected.ipa Payload )
+          ls -l injected.ipa
+
+      - name: 签名（未配 secrets 时自动跳过）
+        id: sign
+        env:
+          P12_B64: ${{ secrets.SIGN_P12_BASE64 }}
+          P12_PASS: ${{ secrets.SIGN_P12_PASS }}
+          PROF_B64: ${{ secrets.SIGN_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${P12_B64:-}" ] || [ -z "${PROF_B64:-}" ]; then
+            echo "SKIP: 没有配置 SIGN_P12_BASE64 / SIGN_PROFILE_BASE64，只产出未签名 injected.ipa"
+            exit 0
+          fi
+          echo "$P12_B64" | base64 -d > cert.p12
+          echo "$PROF_B64" | base64 -d > profile.mobileprovision
+
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import cert.p12 -k build.keychain -P "$P12_PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
+
+          IDENT=$(security find-identity -v -p codesigning build.keychain | awk 'NR==1{print $2}')
+
+          rm -rf sign && mkdir sign && unzip -qo injected.ipa -d sign
+          APP=$(ls -d sign/Payload/*.app)
+          security cms -D -i profile.mobileprovision > prof.plist
+          /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' prof.plist > ent.plist
+          for k in platform-application com.apple.private.security.no-container com.apple.private.system-keychain; do
+            /usr/libexec/PlistBuddy -c "Delete :$k" ent.plist 2>/dev/null || true
+          done
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups' ent.plist \
+            && echo "App Group OK" || echo "!! 没有 App Group，worse_query 将不可用"
+
+          # 从叶子到根
+          find "$APP" -type f -print0 | while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q Mach-O; then
+              case "$f" in */OPEN) continue;; esac
+              codesign -f -s "$IDENT" "$f"
+            fi
+          done
+          codesign -f -s "$IDENT" --identifier "${{ inputs.identifier }}" --entitlements ent.plist "$APP/OPEN"
+          codesign -f -s "$IDENT" --identifier "${{ inputs.identifier }}" "$APP"
+
+          codesign -dvv "$APP/OPEN" 2>&1 | grep -E 'Identifier|TeamIdentifier'
+          ( cd sign && rm -f ../signed.ipa && zip -qry ../signed.ipa Payload )
+          ls -l signed.ipa
+
+      - name: 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: wq-ipa
+          path: |
+            WQCollector.dylib
+            injected.ipa
+            signed.ipa
+          if-no-files-found: warn
