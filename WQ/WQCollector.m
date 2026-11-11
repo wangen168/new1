@@ -16,9 +16,9 @@
 #import <stdarg.h>
 #include "worse_query.h"
 
-// SecTask 的部分符号在个别 SDK 里没有公开声明，显式声明一次，避免 implicit declaration 报错
-extern SecTaskRef SecTaskCreateFromSelf(CFAllocatorRef allocator);
-extern CFTypeRef SecTaskCopyValueForEntitlement(SecTaskRef task, CFStringRef entitlement, CFErrorRef *error);
+// SecTask 是 macOS 的公开 API，iOS SDK 里没有这个类型 —— 自己定义类型，
+// 符号一律走 dlsym（避免链接期 undefined symbol）
+typedef struct CF_BRIDGED_TYPE(id) __SecTask *SecTaskRef;
 
 static NSString *const kLogName   = @"wq_collector.log";
 static NSString *const kStaging   = @"wq_staging";
@@ -45,18 +45,52 @@ static void WQLog(NSString *fmt, ...) {
 
 #pragma mark - 环境：App Group / 系统版本
 
+// 兜底：从包内 embedded.mobileprovision 里读 Entitlements → application-groups
+// （SecTask 在个别系统上被收走时用这条路）
+static NSString *WQGroupFromProfile(void) {
+    NSString *prof = [[[NSBundle mainBundle] bundlePath]
+                      stringByAppendingPathComponent:@"embedded.mobileprovision"];
+    NSData *d = [NSData dataWithContentsOfFile:prof];
+    if (!d.length) return nil;
+    NSRange start = [d rangeOfData:[@"<?xml" dataUsingEncoding:NSUTF8StringEncoding]
+                           options:0 range:NSMakeRange(0, d.length)];
+    NSRange end   = [d rangeOfData:[@"</plist>" dataUsingEncoding:NSUTF8StringEncoding]
+                           options:NSBackwardsSearch range:NSMakeRange(0, d.length)];
+    if (start.location == NSNotFound || end.location == NSNotFound) return nil;
+    NSRange r = NSMakeRange(start.location, NSMaxRange(end) - start.location);
+    NSData *plist = [d subdataWithRange:r];
+    NSDictionary *pl = [NSPropertyListSerialization propertyListWithData:plist
+                                                                options:0 format:NULL error:NULL];
+    NSArray *groups = pl[@"Entitlements"][@"com.apple.security.application-groups"];
+    return [groups isKindOfClass:[NSArray class]] ? groups.firstObject : nil;
+}
+
 static NSString *WQAppGroup(void) {
-    SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
-    if (!task) return nil;
-    CFTypeRef v = SecTaskCopyValueForEntitlement(task, CFSTR("com.apple.security.application-groups"), NULL);
-    CFRelease(task);
-    NSString *g = nil;
-    if (v && CFGetTypeID(v) == CFArrayGetTypeID()) {
-        NSArray *arr = (__bridge_transfer NSArray *)v;
-        if (arr.count) g = arr.firstObject;
-    } else if (v) {
-        CFRelease(v);
+    // SecTask* 在 iOS 上是私有符号：SDK 没声明、链接期也找不到，只能 dlsym
+    void *sec = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
+    void *scope = sec ? sec : RTLD_DEFAULT;
+    SecTaskRef (*taskCreate)(CFAllocatorRef) =
+        (SecTaskRef (*)(CFAllocatorRef))dlsym(scope, "SecTaskCreateFromSelf");
+    CFTypeRef (*copyEnt)(SecTaskRef, CFStringRef, CFErrorRef *) =
+        (CFTypeRef (*)(SecTaskRef, CFStringRef, CFErrorRef *))dlsym(scope, "SecTaskCopyValueForEntitlement");
+
+    if (taskCreate && copyEnt) {
+        SecTaskRef task = taskCreate(kCFAllocatorDefault);
+        if (task) {
+            CFTypeRef v = copyEnt(task, CFSTR("com.apple.security.application-groups"), NULL);
+            CFRelease(task);
+            if (v && CFGetTypeID(v) == CFArrayGetTypeID()) {
+                NSArray *arr = (__bridge_transfer NSArray *)v;
+                if (arr.count) return arr.firstObject;
+            } else if (v) {
+                CFRelease(v);
+            }
+        }
     }
+
+    // 兜底：从包内 mobileprovision 读
+    NSString *g = WQGroupFromProfile();
+    if (g) WQLog(@"App Group 从 mobileprovision 读取: %@", g);
     return g;
 }
 
